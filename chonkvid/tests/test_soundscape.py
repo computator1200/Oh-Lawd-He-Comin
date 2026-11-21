@@ -155,6 +155,24 @@ def test_post_chatter_takes_a_language_map(monkeypatch, tmp_path):
     assert bad.status_code == 400
 
 
+def test_engine_has_a_real_mute_and_speech_bubbles():
+    """Regression guards for the controls: mute has to kill live sources, not just timers."""
+    from fastapi.testclient import TestClient
+
+    from chonkvid.server import app
+
+    c = TestClient(app)
+    js = c.get("/static/world/sound.js").text
+    assert "killEdge" in js and "sources.push" in js, "mute must stop scheduled sources"
+    assert "active()" in js, "the bubbles need the engine's live list"
+    world = c.get("/static/world/world.js").text
+    assert "drawBubble" in world and "SoundPhysics.active()" in world
+    assert 'zoom-in' in world and 'zoom-out' in world
+    page = c.get("/world").text
+    assert 'id="zoom-in"' in page and 'id="zoom-out"' in page
+    assert "Sound off" in page
+
+
 def test_world_view_loads_the_engine():
     from fastapi.testclient import TestClient
 

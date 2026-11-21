@@ -889,7 +889,37 @@
       g.fillText(S.virus.glyph, x, y + 1);
     }
 
+    // speech bubbles over the agents whose link is talking right now
+    if (window.SoundPhysics && window.SoundPhysics.on) {
+      for (const t of window.SoundPhysics.active()) {
+        if (t.g <= 0.06) continue;
+        drawBubble(g, t.x1, t.y1, t.g, t.solo, now);
+        drawBubble(g, t.x2, t.y2, t.g, t.solo, now + 260);
+      }
+    }
+
     requestAnimationFrame(frame);
+  }
+
+  // A speech bubble over an agent that is talking: three dots pulsing in sequence, sized
+  // and brightened by how audible the link is, warmer and larger when the link is soloed.
+  function drawBubble(g, x, y, gain, solo, now) {
+    const s = (solo ? 1.5 : 1.15) * (0.85 + 0.4 * gain);
+    const w = 24 * s, h = 13 * s;
+    const bx = x - w / 2, by = y - 20 * s - h;
+    g.save();
+    g.globalAlpha = Math.max(0.45, Math.min(1, 0.55 + gain));
+    g.fillStyle = solo ? "rgba(255,226,180,0.96)" : "rgba(240,248,255,0.92)";
+    g.beginPath(); g.roundRect(bx, by, w, h, 4 * s); g.fill();
+    g.beginPath(); g.moveTo(x - 3 * s, by + h - 0.5); g.lineTo(x, by + h + 4.5 * s);
+    g.lineTo(x + 3 * s, by + h - 0.5); g.closePath(); g.fill();
+    for (let i = 0; i < 3; i++) {
+      const ph = ((now / 300) + i * 0.3) % 1;
+      const r = (1.0 + 0.85 * Math.sin(ph * Math.PI)) * s;
+      g.fillStyle = solo ? "rgba(96,62,18,0.92)" : "rgba(16,38,56,0.86)";
+      g.beginPath(); g.arc(bx + w * (0.26 + i * 0.24), by + h / 2, r, 0, Math.PI * 2); g.fill();
+    }
+    g.restore();
   }
 
   // ------------------------------------------------------------------ pointer: hover, click, pick
@@ -904,6 +934,7 @@
   }
 
   fx.addEventListener("pointermove", (e) => {
+    S.pointer = [e.clientX, e.clientY];
     const a = agentAt(e.clientX, e.clientY);
     S.hover = a;
     if (S.picking) S.hoverCountry = countryUnder(e.clientX, e.clientY);
@@ -1154,29 +1185,47 @@
     };
     $("close-intel").onclick = closeIntel;
     $("zoom-reset").onclick = () => zoomHome();
+    // zoom about the pointer when there is one, so the buttons feel like the touchpad
+    const zoomStep = (factor) => () => {
+      const p = S.pointer || [W / 2, H / 2];
+      d3.select(fx).transition().duration(200)
+        .call(zoom.scaleBy, factor, [Math.max(0, Math.min(W, p[0])), Math.max(0, Math.min(H, p[1]))]);
+    };
+    const zin = $("zoom-in"), zout = $("zoom-out");
+    if (zin) zin.onclick = zoomStep(1.6);
+    if (zout) zout.onclick = zoomStep(1 / 1.6);
+
     const sndBtn = $("sound-toggle");
+    const paintSound = (live) => {
+      if (!sndBtn) return;
+      sndBtn.classList.toggle("on", !!live);
+      sndBtn.textContent = live ? "🔊 Sound on" : "🔇 Sound off";
+      sndBtn.title = live
+        ? "Click a contact link to solo that conversation, again to release. Click here to mute."
+        : "Turn the world's chatter on (Voxtral)";
+      sndBtn.setAttribute("aria-pressed", live ? "true" : "false");
+    };
     if (sndBtn && window.SoundPhysics) {
+      paintSound(false);
       sndBtn.onclick = async () => {
         if (window.SoundPhysics.on) {
           window.SoundPhysics.disable();
-          sndBtn.classList.remove("on");
-          sndBtn.textContent = "🔇 Sound";
-          sndBtn.title = "Turn the world's chatter on (Voxtral)";
+          paintSound(false);
           drawBase();
           return;
         }
         const ok = await window.SoundPhysics.enable();
-        sndBtn.classList.toggle("on", !!ok);
-        sndBtn.textContent = ok ? "🔊 Sound" : "🔇 Sound";
-        sndBtn.title = ok ? "Click a contact link to solo that conversation. Esc releases."
-                          : "This browser has no Web Audio support";
+        paintSound(!!ok);
         if (ok) { loadChatter(); syncCamera(); drawBase(); }
       };
     }
     addEventListener("keydown", (e) => {
+      if (e.target && /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
       if (e.key === "Escape" && window.SoundPhysics && window.SoundPhysics.soloKey) {
         window.SoundPhysics.release(); drawBase();
       }
+      if (e.key === "+" || e.key === "=") { zoomStep(1.6)(); }
+      if (e.key === "-" || e.key === "_") { zoomStep(1 / 1.6)(); }
     });
     $("news-more").onclick = () => { $("headline-list").innerHTML = $("headlines").innerHTML || "<div class='muted'>No headlines yet.</div>"; $("headline-list").classList.toggle("hidden"); };
     $("replay").onclick = replay;

@@ -341,3 +341,10 @@ body.picking #fx { cursor: crosshair; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* zoom stepper: square, so the pair reads as a control rather than two more links */
+.pill.zoom-step {
+  min-width: 34px; text-align: center; font-size: 17px; line-height: 1;
+  padding: 6px 0 7px; font-variant-numeric: tabular-nums;
+}
+@media (max-width: 760px) { .pill.zoom-step { min-width: 30px; font-size: 15px; padding: 4px 0 5px; } }

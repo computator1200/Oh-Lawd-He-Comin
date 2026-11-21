@@ -15,7 +15,7 @@ window.SoundPhysics = (function () {
   "use strict";
 
   const MAX_VOICES = 8;          // simultaneous conversations
-  const NEAR_PX = 18;            // click tolerance for picking a link, in screen px
+  const NEAR_PX = 10;            // click tolerance for picking a link line, in screen px
   const GATE = 0.055;            // below this a voice is silent and its nodes are stopped
 
   let on = false, ctx = null, master = null, comp = null, bed = null, bedGain = null, bedLP = null;
@@ -25,15 +25,23 @@ window.SoundPhysics = (function () {
   const nodes = new Map();        // key -> {gain, lp, panA, panB, gainA, gainB, bufA, bufB, timer, playing}
   const buffers = new Map();      // url -> AudioBuffer
 
-  function radius(k) { return 300 / (1 + Math.max(0, k - 1) * 0.62); }
+  // How far you can hear, in screen pixels. Wide when zoomed out so the whole map is a
+  // faint murmur, tight when zoomed in so only the neighbourhood is in the room.
+  function radius(k) {
+    const scale = cam ? Math.max(0.7, Math.min(1.6, cam.W / 1600)) : 1;
+    return 900 * scale / Math.pow(Math.max(1, k), 1.3);
+  }
   function closeness(k, d) {
     const R = radius(k);
     if (!R || d >= R) return 0;
     return Math.pow(1 - d / R, 1.7);
   }
-  function cutoffFor(g, isSolo) {
+  // Distance muffles: even a loud link keeps its highs rolled off while you are zoomed out,
+  // which is why the world view is chatter you can hear but not follow.
+  function cutoffFor(g, isSolo, k) {
     if (isSolo) return 18000;
-    return 420 + 7000 * Math.pow(Math.max(0, Math.min(1, g)), 0.85);
+    const open = Math.min(1, Math.max(0.3, (k || 1) / 3));
+    return (420 + 7000 * Math.pow(Math.max(0, Math.min(1, g)), 0.85)) * open;
   }
 
   // ---------------------------------------------------------------- graph
@@ -74,6 +82,7 @@ window.SoundPhysics = (function () {
       panA: ctx.createStereoPanner(), panB: ctx.createStereoPanner(),
       gainA: ctx.createGain(), gainB: ctx.createGain(),
       bufA: null, bufB: null, timer: null, playing: false, loading: false, key,
+      sources: [],
     };
     e.lp.type = "lowpass"; e.lp.Q.value = 0.9; e.lp.frequency.value = 600;
     e.gain.gain.value = 0;
@@ -110,8 +119,38 @@ window.SoundPhysics = (function () {
     const total = (bAt - t0) + Math.max(0.8, e.bufB.duration) + 0.7;
     e.timer = setTimeout(() => schedule(key), total * 1000);
     e.playing = true;
-    a.onended = () => { try { a.disconnect(); } catch (x) {} };
-    b.onended = () => { try { b.disconnect(); } catch (x) {} };
+    // keep the live sources so disable() can actually silence them: clearing the timer
+    // alone leaves the already-scheduled pair talking for another ten seconds
+    e.sources.push(a, b);
+    const drop = (src) => () => {
+      try { src.disconnect(); } catch (x) {}
+      const i = e.sources.indexOf(src);
+      if (i >= 0) e.sources.splice(i, 1);
+    };
+    a.onended = drop(a);
+    b.onended = drop(b);
+  }
+
+  function killEdge(key) {
+    const e = nodes.get(key);
+    if (!e) return;
+    if (e.timer) { clearTimeout(e.timer); e.timer = null; }
+    e.playing = false;
+    const now = ctx ? ctx.currentTime : 0;
+    if (ctx) {
+      e.gain.gain.cancelScheduledValues(now);
+      e.gain.gain.setTargetAtTime(0, now, 0.015);
+    }
+    const srcs = e.sources.splice(0, e.sources.length);
+    // small fade so a mute does not click; then hard-stop whatever is still scheduled
+    setTimeout(() => { for (const s of srcs) { try { s.stop(); } catch (x) {} } }, 90);
+  }
+
+  function stopEdge(key) {
+    const e = nodes.get(key);
+    if (!e) return;
+    if (e.timer) { clearTimeout(e.timer); e.timer = null; }
+    e.playing = false;
   }
 
   function startEdge(key, m) {
@@ -123,7 +162,9 @@ window.SoundPhysics = (function () {
       if (!on) return;
       if (!a || !b) return;             // no audio, stay silent
       e.bufA = a; e.bufB = b;
-      if (e.gain.gain.value > GATE) schedule(key);
+      // gate on the gain the mixer is aiming at, not the value mid-ramp: at the moment a
+      // cached clip decodes the gain may still be ~0 even though the link is in earshot
+      if ((e.target || 0) > GATE || solo === key) schedule(key);
     });
   }
 
@@ -157,9 +198,11 @@ window.SoundPhysics = (function () {
     const out = [];
     for (const m of model) {
       const A = screenOf(m.lonA, m.latA), B = screenOf(m.lonB, m.latB);
-      const seg = segDist(cx, cy, A[0], A[1], B[0], B[1]);
-      const d = seg.d, t = seg.t;
-      const mx = A[0] + t * (B[0] - A[0]), my = A[1] + t * (B[1] - A[1]);
+      // the conversation happens at the two speakers, so the nearest speaker decides how
+      // loud it is: a link whose line crosses the middle of the map is not "nearby"
+      const dA = Math.hypot(A[0] - cx, A[1] - cy), dB = Math.hypot(B[0] - cx, B[1] - cy);
+      const d = Math.min(dA, dB);
+      const mx = dA <= dB ? A[0] : B[0], my = dA <= dB ? A[1] : B[1];
       const g = closeness(cam.k, d);
       out.push({ key: m.key, x1: A[0], y1: A[1], x2: B[0], y2: B[1], g, d, mx, my,
                  panA: Math.max(-0.9, Math.min(0.9, (A[0] - cx) / (cam.W / 2) * 0.8)),
@@ -184,12 +227,16 @@ window.SoundPhysics = (function () {
       let g = v ? v.g : 0;
       if (solo) g = isSolo ? Math.max(0.85, g) : g * 0.06;
       const target = keep.has(key) ? Math.max(0, Math.min(1, g)) : 0;
+      e.target = target;
       const t = ctx.currentTime, at = 0.08;
       e.gain.gain.setTargetAtTime(target * 0.9, t, at);
-      e.lp.frequency.setTargetAtTime(cutoffFor(target, isSolo), t, at);
+      e.lp.frequency.setTargetAtTime(cutoffFor(target, isSolo, cam && cam.k), t, at);
       e.panA.pan.setTargetAtTime(v ? v.panA : 0, t, at);
       e.panB.pan.setTargetAtTime(v ? v.panB : 0, t, at);
-      if (target <= GATE) stopEdge(key);
+      // a ducked neighbour is still audible, quietly: do not kill it just because the
+      // solo pushed its gain under the normal gate
+      const floor = (solo && !isSolo) ? 0.01 : GATE;
+      if (target <= floor) killEdge(key);
     }
 
     for (const v of audible) {
@@ -207,7 +254,7 @@ window.SoundPhysics = (function () {
     bedLP.frequency.setTargetAtTime(520 + 900 * (1 - local), ctx.currentTime, 0.25);
   }
 
-  let raf = 0;
+  let raf = 0, tick = 0;
   function pump() {
     if (!on) return;
     if (raf) return;
@@ -222,12 +269,19 @@ window.SoundPhysics = (function () {
       on = true;
       try { await ctx.resume(); } catch (e) {}
       pump();
+      // a slow tick so clips that finish decoding after the last camera move still start,
+      // and so links leaving earshot get silenced without needing a zoom event
+      if (!tick) tick = setInterval(pump, 400);
       return true;
     },
     disable() {
       on = false;
-      for (const key of nodes.keys()) stopEdge(key);
-      if (bedGain) bedGain.gain.setTargetAtTime(0, ctx.currentTime, 0.2);
+      if (tick) { clearInterval(tick); tick = 0; }
+      for (const key of nodes.keys()) killEdge(key);
+      if (bedGain) {
+        bedGain.gain.cancelScheduledValues(ctx.currentTime);
+        bedGain.gain.setTargetAtTime(0, ctx.currentTime, 0.03);
+      }
       solo = null;
     },
     setVolume(v) { vol = Math.max(0, Math.min(1, v)); if (master) master.gain.value = vol; },
@@ -247,6 +301,7 @@ window.SoundPhysics = (function () {
       let best = null, bd = Infinity;
       for (const v of compute()) {
         if (v.g <= 0.02) continue;
+        // pick the drawn line, not the marker: clicking the agent itself still opens its card
         const d = segDist(x, y, v.x1, v.y1, v.x2, v.y2).d;
         if (d < tol && d < bd) { bd = d; best = v.key; }
       }
@@ -271,8 +326,23 @@ window.SoundPhysics = (function () {
       }
       return out;
     },
+    // what is audible right now, with screen positions, for the speech bubbles
+    active() {
+      if (!cam) return [];
+      const view = new Map(compute().map((v) => [v.key, v]));
+      const out = [];
+      for (const [key, e] of nodes) {
+        if (!e.playing && !e.sources.length) continue;
+        const v = view.get(key);
+        if (!v) continue;
+        out.push({ key, x1: v.x1, y1: v.y1, x2: v.x2, y2: v.y2,
+                   g: Math.max(0, Math.min(1, e.gain.gain.value)), solo: solo === key });
+      }
+      return out;
+    },
     stats() {
       const view = compute();
+      const nearest = view.slice(0, 4).map((v) => ({ key: v.key, d: Math.round(v.d), g: +v.g.toFixed(3) }));
       return {
         on, zoom: cam ? cam.k : null, solo,
         ctx: ctx ? ctx.state : "none",
@@ -280,6 +350,7 @@ window.SoundPhysics = (function () {
         audible: view.filter((v) => v.g > GATE).slice(0, MAX_VOICES)
           .map((v) => ({ key: v.key, g: +v.g.toFixed(3), d: Math.round(v.d) })),
         playing: [...nodes.values()].filter((e) => e.playing).map((e) => e.key),
+        nearest,
       };
     },
   };
